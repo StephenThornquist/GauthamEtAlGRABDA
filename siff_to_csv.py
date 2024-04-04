@@ -11,6 +11,8 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 import numpy as np
+import pandas as pd
+
 
 from siffpy import SiffReader
 from sifftrac.ros import find_experiment_containing_timestamp, Experiment
@@ -29,14 +31,13 @@ def load_data(
 
     """
     # I/O boilerplate
-    if ~siff_path.exists():
-        raise FileNotFoundError(f"{siff_path} does not exist")
+    siff_path = Path(siff_path)
     
-    if ~siff_path.suffix == ".siff":
+    if siff_path.suffix != ".siff":
         raise ValueError("The file must be a `.siff` file")
     
     sr = SiffReader(siff_path)
-    tzero = sr.tzero
+    tzero = sr.time_zero
     # Find the temperature control data
     exp = find_experiment_containing_timestamp(
         sr.filename.parent.parent.parent,
@@ -50,11 +51,9 @@ def load_data(
 def to_traces(
     sr : SiffReader,
     rois : List[ROI],
-    )->Tuple[np.ndarray, np.ndarray]:
+    )->np.ndarray:
     """
     """
-    fluorescence = sr.get_frames(frames = sr.im_params.flatten_by_timepoints()).astype(float).reshape(sr.im_params.array_shape).squeeze()
-
     flim_trace = sr.sum_mask_flim(
         sr.flim_params[0],
         rois[0].mask if len(rois) > 0 else np.ones(sr.im_params.volume).squeeze().astype(bool),
@@ -68,9 +67,9 @@ def to_traces(
         mode='same'
     ) 
 
-    return fluorescence, flim_trace_blurred
+    return flim_trace_blurred
 
-def siff_to_series(
+def siff_to_df(
     siff_path : Path,
     save_path : Path,
     )->SiffReader:
@@ -102,17 +101,83 @@ def siff_to_series(
     if ~save_path.parent.exists():
         save_path.mkdir(parents=True)
 
-    tzero = sr.tzero
-
     t_axis = sr.t_axis(reference_time='epoch')
 
-    fluorescence, flim_trace_blurred = to_traces(sr, rois)
+    flim_trace_blurred = to_traces(sr, rois)
+
+
+    fo = flim_trace_blurred.intensity[int(5/sr.dt_frame):int(35/sr.dt_frame)].mean()
+    f = flim_trace_blurred.intensity
+
+    dfof = (f-fo)/fo
+
+
+    crop_temp = exp.warner_temperature.temperature[(exp.warner_temperature.timestamps > sr.time_zero) * (exp.warner_temperature.timestamps < t_axis[-1])].values
+    crop_t = exp.warner_temperature.timestamps[(exp.warner_temperature.timestamps > sr.time_zero) * (exp.warner_temperature.timestamps < t_axis[-1])].values
+    dt_temp = (exp.warner_temperature.timestamps[1] - exp.warner_temperature.timestamps[0])/1e9
+
+    temp_increasing = np.convolve(np.diff(crop_temp), np.ones(int(15/dt_temp)).astype(float)/int(15/dt_temp), mode='same')
+
+    temp_twodir = np.insert(np.convolve(np.diff(temp_increasing), np.ones(int(15/dt_temp)).astype(float)/int(15/dt_temp), mode='same'), 0,0)
+
+    increasing_start = np.where(
+        (temp_increasing > (np.mean(temp_increasing) + np.std(temp_increasing))/2)
+        & (temp_twodir > (np.mean(temp_twodir) + np.std(temp_twodir)))
+    )[0][0]
+
+    increasing_end = np.where(
+        (temp_increasing > (np.mean(temp_increasing) + np.std(temp_increasing))/2)
+        & (temp_twodir < (np.mean(temp_twodir) - np.std(temp_twodir))) &
+        (np.arange(len(temp_twodir)) > increasing_start)
+    )[0][0]
+
+    decreasing_start = np.where(
+        (temp_increasing < (np.mean(temp_increasing) - np.std(temp_increasing))/2)
+        & (temp_twodir < (np.mean(temp_twodir) - np.std(temp_twodir))/2)
+        & (np.arange(len(temp_twodir)) > increasing_end)
+    )[0][0]
+
+    decreasing_end = np.where(
+        (temp_increasing < (np.mean(temp_increasing) - np.std(temp_increasing))/2)
+        & (temp_twodir > (np.mean(temp_twodir) + np.std(temp_twodir))/2)
+        & (np.arange(len(temp_twodir)) > decreasing_start)
+    )[0][0]
+
+    inc_start_t, inc_end_t, dec_start_t, _ = crop_t[increasing_start], crop_t[increasing_end], crop_t[decreasing_start], crop_t[decreasing_end]
+
+    data= [
+        np.mean(
+            dfof[np.where((t_axis < inc_start_t) & (t_axis > (inc_start_t - 30*1e9)))[0]]
+        ),
+        np.mean(
+            dfof[np.where((t_axis < dec_start_t) & (t_axis > inc_end_t))[0]]
+        ),
+
+        np.mean(
+            flim_trace_blurred[np.where((t_axis < inc_start_t) & (t_axis > (inc_start_t - 30*1e9)))[0]]
+        ).lifetime,
+
+        np.mean(
+            flim_trace_blurred[np.where((t_axis < dec_start_t) & (t_axis > inc_end_t))[0]]
+        ).lifetime
+    ]
+
+    if ~(save_path.parent.exists()):
+        save_path.parent.mkdir(parents=True)
+        pd.DataFrame(
+            data = [data],
+            columns = ['flim_20', 'flim_30', 'flim_20_lifetime', 'flim_30_lifetime']
+        ).to_csv(save_path, index = False)
+    else:
+        df = pd.read_csv(save_path)
+        # append the new data to the end of the df
+        df.loc[len(df)] = data
+        df.to_csv(save_path, index = False)
 
 def plot_timeseries(
     sr : SiffReader,
     exp : Experiment,
     t_axis : np.ndarray,
-    fluorescence : np.ndarray,
     flim_trace_blurred : np.ndarray,
     save_path : Optional[Path] = None,
 )->Tuple[Figure, Axes]:
@@ -208,78 +273,65 @@ def plot_timeseries(
 
 def plot_summary(
     csv_path : Path,
-    save_path : Path
+    color : str = BRIGHT_VIOLET,
+    save_path : Optional[Path] = None,
+    ax: Optional[Axes] = None,
+    condition_1 = 'flim_20',
+    condition_2 = 'flim_30',
 ):
     """
+    Plots a .csv file that contains summary statistics
     """
+    return_fig = False
+    if ax is None:
+        return_fig = True
+        fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (4,1.5))
 
-    import pandas as pd
-
-    fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (4,1.5))
-
-    df_together = pd.read_excel(Path(f'/Users/stephen/Documents/Manuscripts/Demotivation/Nat 2023 Review/Feb24/dopamine_imaging_data/')/ 'summary_trp.xlsx')
+    df_together = pd.read_excel(csv_path)
 
     x_jit = np.random.normal(0, 0.03, len(df_together))
-    ax.plot(x_jit, df_together.flim_20, 'o', color = BRIGHT_VIOLET, alpha = 0.5, markersize = 4)
+    ax.plot(x_jit, df_together[condition_1], 'o', color = color, alpha = 0.5, markersize = 4)
 
     for x in range(len(df_together)):
-        ax.plot([x_jit[x], 1+x_jit[x]], [df_together.flim_20[x], df_together.flim_30[x]], color = 'k', alpha = 0.5)
+        ax.plot(
+            [x_jit[x], 1+x_jit[x]],
+            [df_together[condition_1][x], df_together[condition_2][x]],
+            color = 'k', alpha = 0.5
+        )
 
-    ax.plot(1+x_jit, df_together.flim_30, 'o', color = BRIGHT_VIOLET, alpha = 1.0, markersize = 4)
+    ax.plot(1+x_jit, df_together[condition_2], 'o', color = color, alpha = 1.0, markersize = 4)
 
-    ax.plot([-0.15, 0.15], np.mean(df_together.flim_20)*np.ones(2), color = 'k', alpha = 1.0, linewidth = 3)
+    ax.plot(
+        [-0.15, 0.15],
+        np.mean(df_together[condition_1])*np.ones(2),
+        color = 'k', alpha = 1.0, linewidth = 3
+    )
     ax.plot(
         [0,0],
         [
-            np.mean(df_together.flim_20)-np.std(df_together.flim_20)/np.sqrt(len(df_together.flim_20)),
-            np.mean(df_together.flim_20)+np.std(df_together.flim_20)/np.sqrt(len(df_together.flim_20))
+            np.mean(df_together[condition_1])-np.std(df_together[condition_1])/np.sqrt(len(df_together[condition_1])),
+            np.mean(df_together[condition_1])+np.std(df_together[condition_1])/np.sqrt(len(df_together[condition_1]))
         ], color = 'k', alpha = 1.0, linewidth = 3
     )
-    ax.plot([0.85, 1.15], np.mean(df_together.flim_30)*np.ones(2), color = 'k', alpha = 1.0, linewidth = 3)
+    ax.plot([0.85, 1.15], np.mean(df_together[condition_2])*np.ones(2), color = 'k', alpha = 1.0, linewidth = 3)
     ax.plot(
         [1,1],
         [
-            np.mean(df_together.flim_30)-np.std(df_together.flim_30)/np.sqrt(len(df_together.flim_30)),
-            np.mean(df_together.flim_30)+np.std(df_together.flim_30)/np.sqrt(len(df_together.flim_30))
+            np.mean(df_together[condition_2])-np.std(df_together[condition_2])/np.sqrt(len(df_together[condition_2])),
+            np.mean(df_together[condition_2])+np.std(df_together[condition_2])/np.sqrt(len(df_together[condition_2]))
         ], color = 'k', alpha = 1.0, linewidth = 3
     )
-
-    df_together = pd.read_excel(Path(f'/Users/stephen/Documents/Manuscripts/Demotivation/Nat 2023 Review/Feb24/dopamine_imaging_data/')/ 'summary_wt.xlsx')
-
-    x_jit = 2+np.random.normal(0, 0.03, len(df_together))
-    ax.plot(x_jit, df_together.flim_20, 'o', color = '#000000', alpha = 0.5, markersize = 4)
-
-    for x in range(len(df_together)):
-        ax.plot([x_jit[x], 1+x_jit[x]], [df_together.flim_20[x], df_together.flim_30[x]], color = 'k', alpha = 0.5)
-
-    ax.plot(1+x_jit, df_together.flim_30, 'o', color = '#000000', alpha = 1.0, markersize = 4)
-
-    ax.plot([1.85, 2.15], np.mean(df_together.flim_20)*np.ones(2), color = 'k', alpha = 1.0, linewidth = 3)
-    ax.plot(
-        [2,2],
-        [
-            np.mean(df_together.flim_20)-np.std(df_together.flim_20)/np.sqrt(len(df_together.flim_20)),
-            np.mean(df_together.flim_20)+np.std(df_together.flim_20)/np.sqrt(len(df_together.flim_20))
-        ], color = 'k', alpha = 1.0, linewidth = 3
-    )
-
-    ax.plot([2.85, 3.15], np.mean(df_together.flim_30)*np.ones(2), color = 'k', alpha = 1.0, linewidth = 3)
-
-    ax.plot(
-        [3,3],
-        [
-            np.mean(df_together.flim_30)-np.std(df_together.flim_30)/np.sqrt(len(df_together.flim_30)),
-            np.mean(df_together.flim_30)+np.std(df_together.flim_30)/np.sqrt(len(df_together.flim_30))
-        ], color = 'k', alpha = 1.0, linewidth = 3
-    )
-
 
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['bottom'].set_visible(False)
     ax.set_xticks([])
-    #ax.set_yticks([-0.5, 0, 0.5, 1.0])
 
-    fig.savefig(
-        Path(save_path)/'summary.pdf',
-    )
+    if save_path is not None:
+        fig.savefig(
+            save_path,
+            bbox_inches = 'tight'
+        )
+
+    if return_fig:
+        return fig, ax

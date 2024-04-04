@@ -6,6 +6,10 @@ TODO:
 - LICENSE.md
 - Simple install
 
+Data are available at:
+
+https://figshare.com/account/projects/200581/articles/25538206
+
 To get `sifftrac`, `siffpy`, and `siffroi` go to the following repositories:
 
 - https://github.com/MaimonLab/SiffPy

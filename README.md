@@ -5,3 +5,11 @@ TODO:
 - requirements.txt
 - LICENSE.md
 - Simple install
+
+To get `sifftrac`, `siffpy`, and `siffroi` go to the following repositories:
+
+- https://github.com/MaimonLab/SiffPy
+
+- https://github.com/MaimonLab/SiffRoi
+
+- https://github.com/MaimonLab/SiffTrac
